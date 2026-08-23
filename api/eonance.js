@@ -80,16 +80,17 @@ export default async function handler(req, res) {
     }
     if (req.method === "GET" && action === "dashboard") {
       const auth = await investor(req); if (auth.error) return send(res, 401, { error: auth.error });
-      const [profile, wallet, holdings, activity, notifications] = await Promise.all([
+      const [profile, wallet, holdings, activity, notifications, announcement] = await Promise.all([
         auth.client.from("profiles").select("*").eq("id", auth.user.id).single(),
         auth.client.from("wallets").select("*").eq("user_id", auth.user.id).single(),
         auth.client.from("user_products").select("*, products(*)").eq("user_id", auth.user.id).order("created_at", { ascending: false }),
         auth.client.from("wallet_transactions").select("*").eq("user_id", auth.user.id).order("created_at", { ascending: false }).limit(12),
         auth.client.from("notifications").select("*, notification_reads(user_id)").or(`user_id.eq.${auth.user.id},user_id.is.null`).order("created_at", { ascending: false }).limit(10),
+        settings(["announcement_enabled", "announcement_title", "announcement_message", "telegram_channel_link", "telegram_group_link", "customer_service_link", "telegram_link", "support_email", "service_phone"]),
       ]);
       const error = [profile, wallet, holdings, activity, notifications].find(item => item.error)?.error;
       if (error) throw error;
-      return send(res, 200, { profile: profile.data, wallet: wallet.data, holdings: holdings.data || [], activity: activity.data || [], notifications: hydrateNotifications(notifications.data || [], auth.user.id) });
+      return send(res, 200, { profile: profile.data, wallet: wallet.data, holdings: holdings.data || [], activity: activity.data || [], notifications: hydrateNotifications(notifications.data || [], auth.user.id), announcement });
     }
     if (req.method === "GET" && action === "alerts") {
       const auth = await investor(req); if (auth.error) return send(res, 401, { error: auth.error });
@@ -155,7 +156,7 @@ export default async function handler(req, res) {
     }
     if (req.method === "GET" && action === "admin-summary") {
       const auth = await requireAdmin(req); if (auth.error) return send(res, 403, { error: auth.error });
-      const [profileRows, walletRows, deposits, withdrawals, products, activity, settingRows] = await Promise.all([
+      const [profileRows, walletRows, deposits, withdrawals, products, activity, settingRows, giftCodes] = await Promise.all([
         admin().from("profiles").select("id,email,full_name,is_active,is_admin,created_at").order("created_at", { ascending: false }).limit(100),
         admin().from("wallets").select("user_id,deposit_balance,income_balance,total_invested,total_income").limit(100),
         admin().from("deposits").select("*").order("created_at", { ascending: false }).limit(100),
@@ -163,8 +164,9 @@ export default async function handler(req, res) {
         admin().from("products").select("*").order("sort_order"),
         admin().from("wallet_transactions").select("*").order("created_at", { ascending: false }).limit(100),
         admin().from("site_settings").select("key,value"),
+        admin().from("gift_codes").select("id,code,amount,max_uses,uses,status,expires_at,created_at").order("created_at", { ascending: false }).limit(50),
       ]);
-      const error = [profileRows, walletRows, deposits, withdrawals, products, activity, settingRows].find(item => item.error)?.error;
+      const error = [profileRows, walletRows, deposits, withdrawals, products, activity, settingRows, giftCodes].find(item => item.error)?.error;
       if (error) {
         console.error("[eonance:admin-summary]", error);
         return send(res, 500, { error: "Operations data could not be loaded", detail: error.message || "The Supabase operations query failed" });
@@ -183,6 +185,7 @@ export default async function handler(req, res) {
         products: products.data || [],
         activity: (activity.data || []).map(row => ({ ...row, profiles: profileFor(row.user_id) })),
         settings: Object.fromEntries((settingRows.data || []).map(row => [row.key, row.value])),
+        gift_codes: giftCodes.data || [],
       });
     }
     if (req.method !== "POST") return send(res, 405, { error: "Unsupported request" });
@@ -275,8 +278,21 @@ export default async function handler(req, res) {
       if (error || !data?.ok) return send(res, 400, { error: error?.message || data?.error || "Balance credit failed" });
       return send(res, 200, data);
     }
+    if (action === "admin-gift-code") {
+      const amount = Number(body.amount);
+      const maxUses = Math.max(1, Math.floor(Number(body.max_uses || 1)));
+      const requested = String(body.code || "").trim().toUpperCase();
+      const code = requested || `EON-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+      if (!Number.isFinite(amount) || amount <= 0) return send(res, 400, { error: "Gift-code amount must be greater than zero" });
+      if (!/^EON-[A-Z0-9-]{4,32}$/.test(code)) return send(res, 400, { error: "Gift code must begin with EON- and use letters, numbers, or hyphens" });
+      const expiresAt = body.expires_at ? new Date(body.expires_at) : null;
+      if (expiresAt && Number.isNaN(expiresAt.getTime())) return send(res, 400, { error: "Gift-code expiry is invalid" });
+      const { data, error } = await admin().from("gift_codes").insert({ code, amount, max_uses: maxUses, expires_at: expiresAt?.toISOString() || null }).select("id,code,amount,max_uses,uses,status,expires_at").single();
+      if (error) return send(res, 400, { error: error.message || "Gift-code generation failed" });
+      return send(res, 200, { ok: true, gift_code: data });
+    }
     if (action === "admin-settings") {
-      const allowed = new Set(["bank_name", "account_name", "account_number", "min_deposit", "min_withdraw", "withdrawal_fee_percent", "welcome_bonus", "daily_checkin_bonus", "gift_code_release_time", "referral_percent_l1", "referral_percent_l2", "referral_percent_l3", "support_email", "service_phone", "telegram_link"]);
+      const allowed = new Set(["bank_name", "account_name", "account_number", "min_deposit", "min_withdraw", "withdrawal_fee_percent", "welcome_bonus", "daily_checkin_bonus", "gift_code_release_time", "referral_percent_l1", "referral_percent_l2", "referral_percent_l3", "support_email", "service_phone", "telegram_link", "announcement_enabled", "announcement_title", "announcement_message", "telegram_channel_link", "telegram_group_link", "customer_service_link"]);
       const rows = Object.entries(body.settings || {}).filter(([key]) => allowed.has(key)).map(([key, value]) => ({ key, value: String(value) }));
       if (!rows.length) return send(res, 400, { error: "No permitted settings were supplied" });
       const { error } = await admin().from("site_settings").upsert(rows, { onConflict: "key" });
