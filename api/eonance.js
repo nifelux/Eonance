@@ -98,6 +98,16 @@ export default async function handler(req, res) {
       if (error) throw error;
       return send(res, 200, { alerts: hydrateNotifications(data || [], auth.user.id) });
     }
+    if (req.method === "GET" && action === "income-history") {
+      const auth = await investor(req); if (auth.error) return send(res, 401, { error: auth.error });
+      const requestUrl = new URL(req.url || "/api/eonance", "https://eonance.local");
+      const page = Math.max(1, Math.floor(Number(req.query?.page || requestUrl.searchParams.get("page") || 1)) || 1);
+      const limit = Math.min(50, Math.max(5, Math.floor(Number(req.query?.limit || requestUrl.searchParams.get("limit") || 20)) || 20));
+      const from = (page - 1) * limit;
+      const { data, error, count } = await auth.client.from("wallet_transactions").select("id,amount,description,reference,metadata,created_at", { count: "exact" }).eq("user_id", auth.user.id).eq("balance_type", "income").eq("type", "daily_income").order("created_at", { ascending: false }).range(from, from + limit - 1);
+      if (error) throw error;
+      return send(res, 200, { transactions: data || [], page, limit, total: count || 0, has_more: from + (data || []).length < (count || 0) });
+    }
     if (req.method === "GET" && action === "team") {
       const auth = await investor(req); if (auth.error) return send(res, 401, { error: auth.error });
       const [profile, levelOne] = await Promise.all([
