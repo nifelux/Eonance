@@ -97,19 +97,86 @@ export default async function handler(req, res) {
       if (error) throw error;
       return send(res, 200, { alerts: hydrateNotifications(data || [], auth.user.id) });
     }
+    if (req.method === "GET" && action === "team") {
+      const auth = await investor(req); if (auth.error) return send(res, 401, { error: auth.error });
+      const [profile, levelOne] = await Promise.all([
+        admin().from("profiles").select("referral_code").eq("id", auth.user.id).single(),
+        admin().from("profiles").select("id,full_name,created_at").eq("referred_by", auth.user.id).order("created_at", { ascending: false }).limit(100),
+      ]);
+      const error = [profile, levelOne].find(item => item.error)?.error;
+      if (error) throw error;
+      const levelOneRows = levelOne.data || [];
+      const levelOneIds = levelOneRows.map(member => member.id);
+      const { data: levelTwoRows, error: levelTwoError } = levelOneIds.length
+        ? await admin().from("profiles").select("id,full_name,created_at").in("referred_by", levelOneIds).order("created_at", { ascending: false }).limit(300)
+        : { data: [], error: null };
+      if (levelTwoError) throw levelTwoError;
+      const levelTwoIds = (levelTwoRows || []).map(member => member.id);
+      const { data: levelThreeRows, error: levelThreeError } = levelTwoIds.length
+        ? await admin().from("profiles").select("id,full_name,created_at").in("referred_by", levelTwoIds).order("created_at", { ascending: false }).limit(900)
+        : { data: [], error: null };
+      if (levelThreeError) throw levelThreeError;
+      const team = [
+        ...levelOneRows.map(member => ({ ...member, level: 1 })),
+        ...(levelTwoRows || []).map(member => ({ ...member, level: 2 })),
+        ...(levelThreeRows || []).map(member => ({ ...member, level: 3 })),
+      ];
+      const memberIds = team.map(member => member.id);
+      const { data: teamDeposits, error: depositsError } = memberIds.length
+        ? await admin().from("deposits").select("user_id,amount").in("user_id", memberIds).eq("status", "completed")
+        : { data: [], error: null };
+      if (depositsError) throw depositsError;
+      const depositsByMember = new Map();
+      for (const deposit of teamDeposits || []) {
+        depositsByMember.set(deposit.user_id, Number(depositsByMember.get(deposit.user_id) || 0) + Number(deposit.amount || 0));
+      }
+      const enrichedTeam = team.map(member => ({ ...member, verified_deposits: Number(depositsByMember.get(member.id) || 0) }));
+      const levels = [1, 2, 3].map(level => {
+        const membersAtLevel = enrichedTeam.filter(member => member.level === level);
+        return { level, members: membersAtLevel, verified_deposits: membersAtLevel.reduce((sum, member) => sum + member.verified_deposits, 0) };
+      });
+      return send(res, 200, { referral_code: profile.data?.referral_code || "", team: enrichedTeam, levels, team_deposits: enrichedTeam.reduce((sum, member) => sum + member.verified_deposits, 0) });
+    }
+    if (req.method === "GET" && action === "deposit-status") {
+      const auth = await investor(req); if (auth.error) return send(res, 401, { error: auth.error });
+      const reference = String(req.query?.reference || "").trim();
+      if (!reference) return send(res, 400, { error: "Deposit reference is required" });
+      const { data: deposit, error } = await auth.client.from("deposits").select("id,amount,reference,narration,status,created_at,expires_at,approved_at,paid_at").eq("reference", reference).eq("user_id", auth.user.id).single();
+      if (error || !deposit) return send(res, 404, { error: "Deposit reservation is unavailable" });
+      const bank = await settings(["bank_name", "account_name", "account_number"]);
+      return send(res, 200, { deposit, bank, expired: deposit.status === "pending" && new Date(deposit.expires_at).getTime() <= Date.now() });
+    }
     if (req.method === "GET" && action === "admin-summary") {
       const auth = await requireAdmin(req); if (auth.error) return send(res, 403, { error: auth.error });
-      const [users, deposits, withdrawals, products, activity, settingRows] = await Promise.all([
-        admin().from("profiles").select("id,email,full_name,is_active,is_admin,created_at,wallets(deposit_balance,income_balance,total_invested,total_income)").order("created_at", { ascending: false }).limit(100),
-        admin().from("deposits").select("*, profiles(full_name,email)").order("created_at", { ascending: false }).limit(100),
-        admin().from("withdrawals").select("*, profiles(full_name,email)").order("created_at", { ascending: false }).limit(100),
+      const [profileRows, walletRows, deposits, withdrawals, products, activity, settingRows] = await Promise.all([
+        admin().from("profiles").select("id,email,full_name,is_active,is_admin,created_at").order("created_at", { ascending: false }).limit(100),
+        admin().from("wallets").select("user_id,deposit_balance,income_balance,total_invested,total_income").limit(100),
+        admin().from("deposits").select("*").order("created_at", { ascending: false }).limit(100),
+        admin().from("withdrawals").select("*").order("created_at", { ascending: false }).limit(100),
         admin().from("products").select("*").order("sort_order"),
-        admin().from("wallet_transactions").select("*, profiles(full_name,email)").order("created_at", { ascending: false }).limit(100),
+        admin().from("wallet_transactions").select("*").order("created_at", { ascending: false }).limit(100),
         admin().from("site_settings").select("key,value"),
       ]);
-      const error = [users, deposits, withdrawals, products, activity, settingRows].find(item => item.error)?.error;
-      if (error) throw error;
-      return send(res, 200, { users: users.data || [], deposits: deposits.data || [], withdrawals: withdrawals.data || [], products: products.data || [], activity: activity.data || [], settings: Object.fromEntries((settingRows.data || []).map(row => [row.key, row.value])) });
+      const error = [profileRows, walletRows, deposits, withdrawals, products, activity, settingRows].find(item => item.error)?.error;
+      if (error) {
+        console.error("[eonance:admin-summary]", error);
+        return send(res, 500, { error: "Operations data could not be loaded", detail: error.message || "The Supabase operations query failed" });
+      }
+      const profilesById = new Map((profileRows.data || []).map(profile => [profile.id, profile]));
+      const walletsByUserId = new Map((walletRows.data || []).map(wallet => [wallet.user_id, wallet]));
+      const profileFor = userId => {
+        const profile = profilesById.get(userId);
+        return profile ? { full_name: profile.full_name, email: profile.email } : null;
+      };
+      const users = (profileRows.data || []).map(profile => ({ ...profile, wallets: walletsByUserId.has(profile.id) ? [walletsByUserId.get(profile.id)] : [] }));
+      return send(res, 200, {
+        users,
+        deposits: (deposits.data || []).map(row => ({ ...row, profiles: profileFor(row.user_id) })),
+        withdrawals: (withdrawals.data || []).map(row => ({ ...row, profiles: profileFor(row.user_id) })),
+        products: products.data || [],
+        activity: (activity.data || []).map(row => ({ ...row, profiles: profileFor(row.user_id) })),
+        settings: Object.fromEntries((settingRows.data || []).map(row => [row.key, row.value])),
+      });
     }
     if (req.method !== "POST") return send(res, 405, { error: "Unsupported request" });
     const auth = action.startsWith("admin-") ? await requireAdmin(req) : await investor(req);
@@ -136,7 +203,7 @@ export default async function handler(req, res) {
       const { data, error } = await auth.client.rpc("eonance_open_deposit", { p_user_id: auth.user.id, p_amount: Number(body.amount), p_method: body.method || "manual" });
       if (error || !data?.ok) return send(res, 400, { error: error?.message || data?.error || "Deposit request failed" });
       const bank = await settings(["bank_name", "account_name", "account_number"]);
-      await notify(`<b>New Eonance deposit review</b>\nAmount: ₦${Number(body.amount).toLocaleString()}\nReference: ${data.reference}`);
+      await notify(`<b>New Eonance deposit review</b>\nInvestor: ${auth.user.email || auth.user.id}\nAmount: ₦${Number(body.amount).toLocaleString()}\nReference: ${data.reference}\nApproval window: 10 minutes`);
       return send(res, 200, { ...data, bank });
     }
     if (action === "withdraw") {
@@ -216,6 +283,7 @@ export default async function handler(req, res) {
     }
     return send(res, 404, { error: "Unknown Eonance action" });
   } catch (error) {
-    return send(res, 500, { error: error instanceof Error ? error.message : "Unexpected Eonance server error" });
+    console.error("[eonance:api]", error);
+    return send(res, 500, { error: "Unexpected Eonance server error", detail: error instanceof Error ? error.message : "Unexpected server-side failure" });
   }
 }
