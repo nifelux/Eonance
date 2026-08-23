@@ -139,10 +139,17 @@ export default async function handler(req, res) {
     }
     if (req.method === "GET" && action === "deposit-status") {
       const auth = await investor(req); if (auth.error) return send(res, 401, { error: auth.error });
-      const reference = String(req.query?.reference || "").trim();
+      const requestUrl = new URL(req.url || "/api/eonance", "https://eonance.local");
+      const reference = String(req.query?.reference || requestUrl.searchParams.get("reference") || "").trim();
       if (!reference) return send(res, 400, { error: "Deposit reference is required" });
-      const { data: deposit, error } = await auth.client.from("deposits").select("id,amount,reference,narration,status,created_at,expires_at,approved_at,paid_at").eq("reference", reference).eq("user_id", auth.user.id).single();
-      if (error || !deposit) return send(res, 404, { error: "Deposit reservation is unavailable" });
+      let { data: deposit, error } = await auth.client.from("deposits").select("id,amount,reference,narration,status,created_at,expires_at,approved_at,paid_at").eq("reference", reference).eq("user_id", auth.user.id).single();
+      if (error && /expires_at/i.test(error.message || "")) {
+        const fallback = await auth.client.from("deposits").select("id,amount,reference,narration,status,created_at,approved_at,paid_at").eq("reference", reference).eq("user_id", auth.user.id).single();
+        deposit = fallback.data ? { ...fallback.data, expires_at: new Date(new Date(fallback.data.created_at).getTime() + 10 * 60 * 1000).toISOString() } : null;
+        error = fallback.error;
+      }
+      if (error) return send(res, 500, { error: "Deposit status could not be loaded", detail: error.message || "The deposit lookup failed" });
+      if (!deposit) return send(res, 404, { error: "Deposit reservation is unavailable" });
       const bank = await settings(["bank_name", "account_name", "account_number"]);
       return send(res, 200, { deposit, bank, expired: deposit.status === "pending" && new Date(deposit.expires_at).getTime() <= Date.now() });
     }
