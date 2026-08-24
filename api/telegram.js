@@ -39,10 +39,18 @@ function reviewKeyboard(kind, reference) {
   ]] };
 }
 
+function escapeTelegramHtml(value) {
+  return String(value || "—").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function withdrawalReviewText(item) {
+  return `<b>Pending Eonance withdrawal</b>\nAmount: ₦${Number(item.amount || 0).toLocaleString()}\nReference: ${escapeTelegramHtml(item.request_reference || item.id)}\nBank: ${escapeTelegramHtml(item.bank_name)}\nAccount name: ${escapeTelegramHtml(item.account_name)}\nAccount number: <code>${escapeTelegramHtml(item.account_number)}</code>\nCreated: ${new Date(item.created_at).toISOString()}`;
+}
+
 async function sendQueue(chatId, kind) {
   const db = client();
   const source = kind === "d" ? "deposits" : "withdrawals";
-  const fields = kind === "d" ? "reference,amount,created_at" : "id,request_reference,amount,created_at";
+  const fields = kind === "d" ? "reference,amount,created_at" : "id,request_reference,amount,bank_name,account_name,account_number,created_at";
   const { data, error } = await db.from(source).select(fields).eq("status", "pending").order("created_at", { ascending: false }).limit(20);
   if (error) throw error;
   if (!(data || []).length) return telegram("sendMessage", { chat_id: chatId, text: `No pending Eonance ${kind === "d" ? "deposits" : "withdrawals"}.` });
@@ -51,7 +59,9 @@ async function sendQueue(chatId, kind) {
     const displayReference = kind === "d" ? item.reference : item.request_reference || item.id;
     await telegram("sendMessage", {
       chat_id: chatId,
-      text: `<b>Pending Eonance ${kind === "d" ? "deposit" : "withdrawal"}</b>\nAmount: ₦${Number(item.amount || 0).toLocaleString()}\nReference: ${displayReference}\nCreated: ${new Date(item.created_at).toISOString()}`,
+      text: kind === "d"
+        ? `<b>Pending Eonance deposit</b>\nAmount: ₦${Number(item.amount || 0).toLocaleString()}\nReference: ${escapeTelegramHtml(displayReference)}\nCreated: ${new Date(item.created_at).toISOString()}`
+        : withdrawalReviewText(item),
       parse_mode: "HTML",
       reply_markup: reviewKeyboard(kind, reference),
     });
@@ -78,6 +88,10 @@ export default async function handler(req, res) {
   if (message?.text) {
     const approverId = approverFor(message.from?.id);
     if (!approverId) return res.status(200).json({ ok: true });
+    if (message.chat?.type !== "private") {
+      await telegram("sendMessage", { chat_id: message.chat.id, text: "For account security, request withdrawal details from this bot's private chat." });
+      return res.status(200).json({ ok: true });
+    }
     const command = String(message.text).trim().toLowerCase().split(/\s+/)[0].replace(/@[^\s]+$/, "");
     try {
       if (["/deposits", "/pending_deposits"].includes(command)) await sendQueue(message.chat.id, "d");
