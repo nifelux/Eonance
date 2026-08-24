@@ -141,15 +141,22 @@ export default async function handler(req, res) {
         ...(levelThreeRows || []).map(member => ({ ...member, level: 3 })),
       ];
       const memberIds = team.map(member => member.id);
-      const { data: teamDeposits, error: depositsError } = memberIds.length
-        ? await admin().from("deposits").select("user_id,amount").in("user_id", memberIds).eq("status", "completed")
-        : { data: [], error: null };
+      const [teamDeposits, verifiedDepositLedger, activeProducts] = memberIds.length
+        ? await Promise.all([
+          admin().from("deposits").select("user_id,amount").in("user_id", memberIds).eq("status", "completed"),
+          admin().from("wallet_transactions").select("user_id,amount").in("user_id", memberIds).eq("balance_type", "deposit").eq("type", "verified_deposit"),
+          admin().from("user_products").select("user_id").in("user_id", memberIds).eq("status", "active"),
+        ])
+        : [{ data: [], error: null }, { data: [], error: null }, { data: [], error: null }];
+      const depositsError = [teamDeposits, verifiedDepositLedger, activeProducts].find(item => item.error)?.error;
       if (depositsError) throw depositsError;
       const depositsByMember = new Map();
-      for (const deposit of teamDeposits || []) {
-        depositsByMember.set(deposit.user_id, Number(depositsByMember.get(deposit.user_id) || 0) + Number(deposit.amount || 0));
-      }
-      const enrichedTeam = team.map(member => ({ ...member, verified_deposits: Number(depositsByMember.get(member.id) || 0) }));
+      const ledgerByMember = new Map();
+      const activeProductsByMember = new Map();
+      for (const deposit of teamDeposits.data || []) depositsByMember.set(deposit.user_id, Number(depositsByMember.get(deposit.user_id) || 0) + Number(deposit.amount || 0));
+      for (const credit of verifiedDepositLedger.data || []) ledgerByMember.set(credit.user_id, Number(ledgerByMember.get(credit.user_id) || 0) + Number(credit.amount || 0));
+      for (const product of activeProducts.data || []) activeProductsByMember.set(product.user_id, Number(activeProductsByMember.get(product.user_id) || 0) + 1);
+      const enrichedTeam = team.map(member => ({ ...member, verified_deposits: Math.max(Number(depositsByMember.get(member.id) || 0), Number(ledgerByMember.get(member.id) || 0)), active_packages: Number(activeProductsByMember.get(member.id) || 0) }));
       const levels = [1, 2, 3].map(level => {
         const membersAtLevel = enrichedTeam.filter(member => member.level === level);
         return { level, members: membersAtLevel, verified_deposits: membersAtLevel.reduce((sum, member) => sum + member.verified_deposits, 0) };
@@ -294,6 +301,12 @@ export default async function handler(req, res) {
     if (action === "admin-credit") {
       const { data, error } = await auth.client.rpc("eonance_admin_credit_balance", { p_user_id: body.user_id, p_balance_type: body.balance_type, p_amount: Number(body.amount), p_reason: body.reason });
       if (error || !data?.ok) return send(res, 400, { error: error?.message || data?.error || "Balance credit failed" });
+      return send(res, 200, data);
+    }
+    if (action === "admin-reconcile-referrals") {
+      const limit = Math.min(2000, Math.max(1, Math.floor(Number(body.limit || 500)) || 500));
+      const { data, error } = await admin().rpc("eonance_reconcile_referral_rewards", { p_limit: limit });
+      if (error || !data?.ok) return send(res, 400, { error: error?.message || data?.error || "Referral reward reconciliation failed" });
       return send(res, 200, data);
     }
     if (action === "admin-gift-code") {
