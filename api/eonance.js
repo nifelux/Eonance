@@ -54,14 +54,22 @@ function hydrateNotifications(rows, investorId) {
   }));
 }
 
-async function notify(text) {
+function reviewKeyboard(kind, reference) {
+  const compactKind = kind === "deposit" ? "d" : "w";
+  return { inline_keyboard: [[
+    { text: "Approve", callback_data: `eon|${compactKind}|c|a|${reference}` },
+    { text: "Reject", callback_data: `eon|${compactKind}|c|r|${reference}` },
+  ]] };
+}
+
+async function notify(text, replyMarkup) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_ADMIN_CHAT_ID;
   if (!token || !chatId) return;
   await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", reply_markup: replyMarkup }),
   }).catch(() => undefined);
 }
 
@@ -223,13 +231,13 @@ export default async function handler(req, res) {
       const { data, error } = await auth.client.rpc("eonance_open_deposit", { p_user_id: auth.user.id, p_amount: Number(body.amount), p_method: body.method || "manual" });
       if (error || !data?.ok) return send(res, 400, { error: error?.message || data?.error || "Deposit request failed" });
       const bank = await settings(["bank_name", "account_name", "account_number"]);
-      await notify(`<b>New Eonance deposit review</b>\nInvestor: ${auth.user.email || auth.user.id}\nAmount: ₦${Number(body.amount).toLocaleString()}\nReference: ${data.reference}\nApproval window: 10 minutes`);
+      await notify(`<b>New Eonance deposit review</b>\nInvestor: ${auth.user.email || auth.user.id}\nAmount: ₦${Number(body.amount).toLocaleString()}\nReference: ${data.reference}\nApproval window: 10 minutes`, reviewKeyboard("deposit", data.reference));
       return send(res, 200, { ...data, bank });
     }
     if (action === "withdraw") {
       const { data, error } = await auth.client.rpc("eonance_request_withdrawal", { p_user_id: auth.user.id, p_amount: Number(body.amount), p_bank_name: body.bank_name, p_account_number: body.account_number, p_account_name: body.account_name });
       if (error || !data?.ok) return send(res, 400, { error: error?.message || data?.error || "Withdrawal request failed" });
-      await notify(`<b>New Eonance withdrawal review</b>\nAmount: ₦${Number(body.amount).toLocaleString()}\nInvestor: ${auth.user.email || auth.user.id}`);
+      await notify(`<b>New Eonance withdrawal review</b>\nAmount: ₦${Number(body.amount).toLocaleString()}\nInvestor: ${auth.user.email || auth.user.id}\nReference: ${data.withdrawal_id}`, reviewKeyboard("withdrawal", data.withdrawal_id));
       return send(res, 200, data);
     }
     if (action === "redeem-gift") {
