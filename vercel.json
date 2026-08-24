@@ -1,7 +1,8 @@
 {
   "functions": {
     "api/eonance.js": {"maxDuration": 30},
-    "api/cron/daily-income.js": {"maxDuration": 60}
+    "api/cron/daily-income.js": {"maxDuration": 60},
+    "api/telegram.js": {"maxDuration": 30}
   },
   "crons": [
     {"path": "/api/cron/daily-income", "schedule": "0 23 * * *"}
